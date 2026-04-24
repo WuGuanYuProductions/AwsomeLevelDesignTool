@@ -10,7 +10,7 @@ from typing import Dict, List, Optional, Tuple
 from PySide6.QtCore import QMimeData, QPoint, QPointF, QLineF, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QAction, QBrush, QColor, QDrag, QFont, QIcon, QImage, QKeySequence,
-    QPainter, QPainterPath, QPen, QPolygonF, QShortcut
+    QPainter, QPainterPath, QPen, QPolygonF, QShortcut, QPixmap
 )
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 from PySide6.QtWidgets import (
@@ -208,6 +208,23 @@ def find_resource_icon() -> QIcon:
                 return QIcon(os.path.join(res_dir, f))
     return QIcon()
 
+def create_eye_icon(is_open=True):
+    pixmap = QPixmap(24, 24)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    painter.setPen(QPen(QColor(80, 80, 80), 1.5))
+    if is_open:
+        painter.drawEllipse(3, 8, 18, 8)
+        painter.setBrush(QColor(80, 80, 80))
+        painter.drawEllipse(9, 9, 6, 6)
+    else:
+        painter.drawLine(3, 12, 21, 12)
+        painter.drawLine(6, 12, 4, 15)
+        painter.drawLine(12, 12, 12, 16)
+        painter.drawLine(18, 12, 20, 15)
+    painter.end()
+    return QIcon(pixmap)
 
 def check_point_inside_platform(shape, px, py) -> bool:
     dx, dy, st = px - shape.x, py - shape.y, shape.shape_type
@@ -240,6 +257,7 @@ def get_real_base_z_with_adjustment(shape, all_shapes, layers) -> float:
 class LayerData:
     name: str
     z_offset: float
+    is_visible: bool = True
 
 
 @dataclass
@@ -252,7 +270,7 @@ class ShapeData:
     depth: float = 1.0
     color: Tuple[int, int, int] = (100, 170, 255)
     label: str = ""
-    font_size: float = 1.0
+    font_size: float = 100.0
     layer_index: int = 0
     base_z: float = 0.0
     end_x: float = 0.0
@@ -866,6 +884,12 @@ class DesignScene(QGraphicsScene):
         item.deleted.connect(self.item_deleted.emit)
         item.changed.connect(self.item_changed.emit)
         self.addItem(item)
+        if getattr(self, "main_window", None):
+            idx = item.shape_data.layer_index
+            if 0 <= idx < len(self.main_window.layers):
+                is_vis = self.main_window.layers[idx].is_visible
+                item.setOpacity(1.0 if is_vis else 0.5)
+                item.setEnabled(is_vis)
 
     def load_from_data(self, layers, shapes):
         self.clear()
@@ -891,6 +915,8 @@ class DesignScene(QGraphicsScene):
 
 
 class ToolListWidget(QListWidget):
+    tool_list_changed = Signal()
+
     def __init__(self):
         super().__init__()
         self.setDragEnabled(True); self.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
@@ -909,17 +935,20 @@ class ToolListWidget(QListWidget):
             res = menu.exec(self.mapToGlobal(pos))
             if res == del_act:
                 self.takeItem(self.row(item))
+                self.tool_list_changed.emit()
             elif res == rename_act:
                 new_name, ok = QInputDialog.getText(self, _T("重命名"), _T("请输入新名称:"), text=item.text())
                 if ok and new_name.strip():
                     item.setText(new_name.strip())
                     item.setData(Qt.ItemDataRole.UserRole + 99, new_name.strip())
+                    self.tool_list_changed.emit()
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_Delete:
             item = self.currentItem()
             if item and item.data(Qt.ItemDataRole.UserRole) in {"custom_2d", "custom_3d"}:
                 self.takeItem(self.row(item))
+                self.tool_list_changed.emit()
                 return
         super().keyPressEvent(event)
 
@@ -1223,7 +1252,7 @@ class OpenGLLevelView(QOpenGLWidget):
     def get_line_sample_points(self, shape, steps: int = 60) -> List[Tuple[float, float]]:
         pts = [(shape.x, shape.y)] + (shape.control_points or []) + [(shape.end_x, shape.end_y)]
         if shape.line_mode != "curve" or len(pts) <= 2: return pts
-        path, qpts = QPainterPath(), [QPointF(x, y) for x, y in pts]
+        path, qpts = [QPointF(x, y) for x, y in pts], QPainterPath()
         path.moveTo(qpts[0]); sm_pts = [qpts[0]] + qpts + [qpts[-1]]
         for i in range(1, len(sm_pts) - 2):
             p0, p1, p2, p3 = sm_pts[i - 1], sm_pts[i], sm_pts[i + 1], sm_pts[i + 2]
@@ -1752,16 +1781,17 @@ class MainWindow(QMainWindow):
         self.history_snapshots, self.history_index, self.is_history_suppressed = [], -1, False
         self.clipboard_shapes, self.paste_offset_index, self.shortcut_settings = [], 0, dict(DEFAULT_SHORTCUTS)
 
-        self.tool_list = ToolListWidget(); self.tool_list.setFixedWidth(180)
+        self.tool_list = ToolListWidget()
         for t, n in [("select", _T("🖱 选择")), ("square", _T("■ 正方形")), ("circle", _T("● 圆形")), ("ellipse", _T("⬭ 椭圆形")), ("triangle", _T("▲ 三角形")), ("rectangle", _T("▭ 长方形")), ("sphere", _T("🔴 球体")), ("cone", _T("🔽 圆锥体")), ("pyramid", _T("◮ 立方锥体")), ("line", _T("╱ 线条")), ("text", _T("T 文字")), ("stair", _T("🪜 楼梯")), ("player", _T("🧍 玩家")), ("enemy", _T("👾 敌人"))]:
             item = QListWidgetItem(n); item.setData(Qt.ItemDataRole.UserRole, t); self.tool_list.addItem(item)
-        self.tool_list.setCurrentRow(0); self.layer_list = QListWidget(); self.layer_list.setFixedWidth(220)
+        self.tool_list.setCurrentRow(0); self.layer_list = QListWidget()
+        self.tool_list.tool_list_changed.connect(lambda: [self.mark_dirty(), self.push_history_snapshot("tool_list_changed")])
         self.refresh_layer_list(); self.layer_list.setCurrentRow(0)
 
         self.add_layer_button = self._create_btn(_T("新增图层"), self.on_add_layer); self.edit_layer_button = self._create_btn(_T("编辑图层"), self.on_edit_layer); self.delete_layer_button = self._create_btn(_T("删除图层"), self.on_delete_layer)
         self.undo_button = self._create_btn(_T("撤销"), self.undo); self.redo_button = self._create_btn(_T("重做"), self.redo); self.shortcut_settings_button = self._create_btn(_T("快捷键设置"), self.on_open_shortcut_settings)
         self.depth_spin = self._create_spinbox(0.05, 9999.0, 0.05, " m", 1.0, self.on_depth_changed); self.base_z_spin = self._create_spinbox(-9999.0, 9999.0, 0.1, " m", 0.0, self.on_base_z_changed)
-        self.font_size_spin = self._create_spinbox(1.0, 200.0, 1.0, " pt", 1.0, self.on_font_size_changed)
+        self.font_size_spin = self._create_spinbox(1.0, 1000.0, 1.0, " pt", 100.0, self.on_font_size_changed)
         self.width_spin = self._create_spinbox(0.1, 9999.0, 0.1, " m", 1.0, self.on_width_changed)
         self.height_spin = self._create_spinbox(0.1, 9999.0, 0.1, " m", 1.0, self.on_height_changed)
         self.rotation_spin = self._create_spinbox(-9999.0, 9999.0, 1.0, " °", 0.0, self.on_rotation_changed)
@@ -1854,6 +1884,7 @@ class MainWindow(QMainWindow):
         main_layout.addLayout(ml, 1)
 
         lp, ll = QWidget(), QVBoxLayout(); lp.setLayout(ll)
+        lp.setFixedWidth(280)
         ll.addWidget(QLabel(_T("工具栏（拖拽到设计区创建图形，线条为点击拖拽绘制）"))); ll.addWidget(self.tool_list)
         ll.addWidget(self.btn_add_2d); ll.addWidget(self.btn_add_3d)
         ll.addWidget(QLabel(_T("图层"))); ll.addWidget(self.layer_list)
@@ -1871,6 +1902,29 @@ class MainWindow(QMainWindow):
         sp = QSplitter(); sp.addWidget(lp); sp.addWidget(rp); sp.setStretchFactor(1, 1); ml.addWidget(sp)
         self.refresh_shape_layer_combo(); self.refresh_stair_binding_combos()
 
+    def toggle_layer_visibility(self, idx):
+        if 0 <= idx < len(self.layers):
+            self.layers[idx].is_visible = not self.layers[idx].is_visible
+            self.refresh_layer_list()
+            self.layer_list.setCurrentRow(idx)
+            self.update_layer_visibility()
+            self.mark_dirty()
+            self.push_history_snapshot("toggle_layer_visibility")
+
+    def update_layer_visibility(self):
+        for item in self.scene.get_design_items_in_order():
+            layer_idx = item.shape_data.layer_index
+            if 0 <= layer_idx < len(self.layers):
+                is_vis = self.layers[layer_idx].is_visible
+            else:
+                is_vis = True
+                
+            item.setOpacity(1.0 if is_vis else 0.5)
+            item.setEnabled(is_vis)
+            if not is_vis and item.isSelected():
+                item.setSelected(False)
+        self.scene.update()
+
     def on_add_custom_2d(self):
         fp, _ = QFileDialog.getOpenFileName(self, _T("请选择 2D 图标"), "", "图片 (*.png *.jpg *.jpeg)")
         if fp:
@@ -1883,6 +1937,8 @@ class MainWindow(QMainWindow):
                 item.setData(Qt.ItemDataRole.UserRole + 1, b64)
                 item.setData(Qt.ItemDataRole.UserRole + 99, name.strip())
                 self.tool_list.addItem(item)
+                self.mark_dirty()
+                self.push_history_snapshot("add_custom_2d")
 
     def on_add_custom_3d(self):
         dlg = Custom3DEditorDialog(self)
@@ -1895,6 +1951,8 @@ class MainWindow(QMainWindow):
                 item.setData(Qt.ItemDataRole.UserRole + 2, dlg.parts)
                 item.setData(Qt.ItemDataRole.UserRole + 99, name.strip())
                 self.tool_list.addItem(item)
+                self.mark_dirty()
+                self.push_history_snapshot("add_custom_3d")
 
     def apply_shortcuts(self) -> None:
         for a in ["undo", "redo", "copy", "cut", "paste"]: getattr(self, f"{a}_shortcut").setKey(QKeySequence(self.shortcut_settings[a]))
@@ -1910,12 +1968,44 @@ class MainWindow(QMainWindow):
     def mark_clean(self): self.is_dirty = False; self.update_window_title()
 
     def build_snapshot(self) -> dict:
-        return {"layers": [asdict(l) for l in self.layers], "shapes": [asdict(s) for s in self.scene.get_all_shapes()], "view": {"show_labels": self.is_3d_label_visible, "perspective_enabled": self.is_3d_perspective_enabled, "wireframe_enabled": self.is_3d_wireframe_enabled}, "shortcuts": dict(self.shortcut_settings), "current_design_file": self.current_design_file}
+        custom_tools = []
+        for i in range(self.tool_list.count()):
+            item = self.tool_list.item(i)
+            st = item.data(Qt.ItemDataRole.UserRole)
+            if st in ("custom_2d", "custom_3d"):
+                tool_data = {
+                    "type": st,
+                    "name": item.data(Qt.ItemDataRole.UserRole + 99) or item.text(),
+                    "image_data": item.data(Qt.ItemDataRole.UserRole + 1) or "",
+                }
+                if st == "custom_3d":
+                    tool_data["parts"] = item.data(Qt.ItemDataRole.UserRole + 2) or []
+                custom_tools.append(tool_data)
+
+        return {"layers": [asdict(l) for l in self.layers], "shapes": [asdict(s) for s in self.scene.get_all_shapes()], "view": {"show_labels": self.is_3d_label_visible, "perspective_enabled": self.is_3d_perspective_enabled, "wireframe_enabled": self.is_3d_wireframe_enabled}, "shortcuts": dict(self.shortcut_settings), "current_design_file": self.current_design_file, "custom_tools": custom_tools}
 
     def restore_snapshot(self, sn: dict) -> None:
         self.is_history_suppressed = True
         try:
-            self.layers = [LayerData(l.get("name", "未命名"), float(l.get("z_offset", 0.0))) for l in sn.get("layers", [])] or [LayerData(_T("第1层"), 0.0)]
+            for i in range(self.tool_list.count() - 1, -1, -1):
+                item = self.tool_list.item(i)
+                st = item.data(Qt.ItemDataRole.UserRole)
+                if st in ("custom_2d", "custom_3d"):
+                    self.tool_list.takeItem(i)
+            
+            custom_tools = sn.get("custom_tools", [])
+            for ct in custom_tools:
+                st = ct.get("type")
+                name = ct.get("name", "Unnamed")
+                item = QListWidgetItem(_T(name))
+                item.setData(Qt.ItemDataRole.UserRole, st)
+                item.setData(Qt.ItemDataRole.UserRole + 1, ct.get("image_data", ""))
+                item.setData(Qt.ItemDataRole.UserRole + 99, name)
+                if st == "custom_3d":
+                    item.setData(Qt.ItemDataRole.UserRole + 2, ct.get("parts", []))
+                self.tool_list.addItem(item)
+
+            self.layers = [LayerData(l.get("name", "未命名"), float(l.get("z_offset", 0.0)), bool(l.get("is_visible", True))) for l in sn.get("layers", [])] or [LayerData(_T("第1层"), 0.0)]
             valid_keys = inspect.signature(ShapeData).parameters.keys()
             shapes = []
             for s in sn.get("shapes", []):
@@ -1925,6 +2015,7 @@ class MainWindow(QMainWindow):
             self.is_3d_label_visible, self.is_3d_perspective_enabled, self.is_3d_wireframe_enabled = bool(vd.get("show_labels", True)), bool(vd.get("perspective_enabled", True)), bool(vd.get("wireframe_enabled", False))
             for k, dv in DEFAULT_SHORTCUTS.items(): self.shortcut_settings[k] = sn.get("shortcuts", {}).get(k, dv)
             self.scene.load_from_data(self.layers, shapes); self.refresh_layer_list(); self.refresh_shape_layer_combo(); self.refresh_stair_binding_combos(); self.layer_list.setCurrentRow(0); self.clear_properties(); self.apply_shortcuts(); self.current_design_file = sn.get("current_design_file", self.current_design_file)
+            self.update_layer_visibility()
         finally: self.is_history_suppressed = False
 
     def push_history_snapshot(self, reason: str = "", force: bool = False) -> None:
@@ -1947,7 +2038,31 @@ class MainWindow(QMainWindow):
     def refresh_layer_list(self):
         self.layer_list.clear()
         for i, l in enumerate(self.layers):
-            it = QListWidgetItem(f"{_T(l.name)} (Z={l.z_offset:.2f}m)"); it.setData(Qt.ItemDataRole.UserRole, i); self.layer_list.addItem(it)
+            item = QListWidgetItem()
+            item.setData(Qt.ItemDataRole.UserRole, i)
+            self.layer_list.addItem(item)
+            
+            widget = QWidget()
+            layout = QHBoxLayout(widget)
+            layout.setContentsMargins(2, 0, 2, 0)
+            layout.setSpacing(4)
+            
+            eye_btn = QPushButton()
+            eye_btn.setFixedSize(24, 24)
+            eye_btn.setIcon(create_eye_icon(l.is_visible))
+            eye_btn.setFlat(True)
+            eye_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            eye_btn.clicked.connect(lambda checked, idx=i: self.toggle_layer_visibility(idx))
+            
+            label = QLabel(f"{_T(l.name)} (Z={l.z_offset:.2f}m)")
+            label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+            
+            layout.addWidget(eye_btn)
+            layout.addWidget(label)
+            layout.addStretch()
+            
+            item.setSizeHint(widget.sizeHint())
+            self.layer_list.setItemWidget(item, widget)
 
     def refresh_shape_layer_combo(self):
         self.shape_layer_combo.blockSignals(True); self.shape_layer_combo.clear()
@@ -1979,7 +2094,8 @@ class MainWindow(QMainWindow):
         if 0 <= idx < len(self.layers):
             dlg = LayerDialog(self, self.layers[idx].name, self.layers[idx].z_offset)
             if dlg.exec() == QDialog.DialogCode.Accepted:
-                self.layers[idx] = LayerData(*dlg.get_data()); self.refresh_layer_list(); self.refresh_shape_layer_combo(); self.refresh_stair_binding_combos(); self.layer_list.setCurrentRow(idx)
+                self.layers[idx] = LayerData(dlg.get_data()[0], dlg.get_data()[1], self.layers[idx].is_visible)
+                self.refresh_layer_list(); self.refresh_shape_layer_combo(); self.refresh_stair_binding_combos(); self.layer_list.setCurrentRow(idx)
                 if self.current_item and self.current_item.scene(): self.on_item_selected(self.current_item)
                 self.mark_dirty(); self.push_history_snapshot("edit_layer")
 
@@ -2054,7 +2170,7 @@ class MainWindow(QMainWindow):
 
     def clear_properties(self):
         self.current_item = None; self._toggle_property_signals(True)
-        self.label_edit.clear(); self.text_content_edit.clear(); self.text_content_edit.setEnabled(False); self.font_size_spin.setValue(1.0); self.base_z_spin.setValue(0.0); self.depth_spin.setValue(1.0); self.depth_spin.setEnabled(True); self.stair_start_combo.setEnabled(False); self.stair_end_combo.setEnabled(False); self.stair_direction_combo.setEnabled(False)
+        self.label_edit.clear(); self.text_content_edit.clear(); self.text_content_edit.setEnabled(False); self.font_size_spin.setValue(100.0); self.base_z_spin.setValue(0.0); self.depth_spin.setValue(1.0); self.depth_spin.setEnabled(True); self.stair_start_combo.setEnabled(False); self.stair_end_combo.setEnabled(False); self.stair_direction_combo.setEnabled(False)
         self.stair_auto_height_cb.setVisible(False)
         self.width_spin.setValue(1.0); self.width_spin.setEnabled(True)
         self.height_spin.setValue(1.0); self.height_spin.setEnabled(True)
@@ -2206,10 +2322,17 @@ class MainWindow(QMainWindow):
     def reset_to_new_design(self):
         self.is_history_suppressed = True
         try:
+            for i in range(self.tool_list.count() - 1, -1, -1):
+                item = self.tool_list.item(i)
+                st = item.data(Qt.ItemDataRole.UserRole)
+                if st in ("custom_2d", "custom_3d"):
+                    self.tool_list.takeItem(i)
+                    
             self.scene.clear(); self.layers = [LayerData(_T("第1层"), 0.0), LayerData(_T("第2层"), 3.0), LayerData(_T("第3层"), 6.0)]
             self.current_item = self.preview_window = None; self.current_design_file = ""; self.clipboard_shapes = []; self.paste_offset_index = 0
             self.refresh_layer_list(); self.refresh_shape_layer_combo(); self.refresh_stair_binding_combos(); self.layer_list.setCurrentRow(0)
             self.clear_properties(); self.mark_clean()
+            self.update_layer_visibility()
         finally: self.is_history_suppressed = False
         self.history_snapshots, self.history_index = [], -1; self.push_history_snapshot("reset", force=True)
 
