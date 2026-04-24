@@ -1884,7 +1884,7 @@ class MainWindow(QMainWindow):
         main_layout.addLayout(ml, 1)
 
         lp, ll = QWidget(), QVBoxLayout(); lp.setLayout(ll)
-        lp.setFixedWidth(280)
+        lp.setMinimumWidth(250)
         ll.addWidget(QLabel(_T("工具栏（拖拽到设计区创建图形，线条为点击拖拽绘制）"))); ll.addWidget(self.tool_list)
         ll.addWidget(self.btn_add_2d); ll.addWidget(self.btn_add_3d)
         ll.addWidget(QLabel(_T("图层"))); ll.addWidget(self.layer_list)
@@ -1900,6 +1900,7 @@ class MainWindow(QMainWindow):
         for w in (self.export_design_button, self.generate_button, self.export_t3d_button): al.addWidget(w)
         rl.addLayout(fl); rl.addLayout(al); rl.addWidget(self.watermark_label)
         sp = QSplitter(); sp.addWidget(lp); sp.addWidget(rp); sp.setStretchFactor(1, 1); ml.addWidget(sp)
+        sp.setSizes([380, 1120])
         self.refresh_shape_layer_combo(); self.refresh_stair_binding_combos()
 
     def toggle_layer_visibility(self, idx):
