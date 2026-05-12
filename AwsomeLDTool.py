@@ -4,13 +4,14 @@ import os
 import sys
 import base64
 import inspect
+import uuid
 from dataclasses import asdict, dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 from PySide6.QtCore import QMimeData, QPoint, QPointF, QLineF, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QAction, QBrush, QColor, QDrag, QFont, QIcon, QImage, QKeySequence,
-    QPainter, QPainterPath, QPen, QPolygonF, QShortcut, QPixmap
+    QPainter, QPainterPath, QPen, QPolygonF, QShortcut, QPixmap, QTransform
 )
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 from PySide6.QtWidgets import (
@@ -19,7 +20,7 @@ from PySide6.QtWidgets import (
     QGraphicsObject, QGraphicsScene, QGraphicsTextItem, QGraphicsView,
     QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
     QMainWindow, QMenu, QMessageBox, QPushButton, QSplitter, QVBoxLayout, QWidget,
-    QInputDialog
+    QInputDialog, QGraphicsItemGroup
 )
 from OpenGL.GL import *
 from OpenGL.GLU import gluLookAt, gluPerspective
@@ -42,6 +43,7 @@ TRANSLATIONS = {
     "打开设计稿": "Open Design",
     "保存设计稿": "Save Design",
     "设计稿另存为": "Save As",
+    "地图拼接": "Merge Maps",
     "导出设计栏图片": "Export Image",
     "生成 3D 视图": "Generate 3D View",
     "新增 2D 图标": "Add 2D Icon",
@@ -169,7 +171,20 @@ TRANSLATIONS = {
     "请输入新名称:": "Enter new name:",
     "对齐网格": "Align to Grid",
     "锁定移动": "Lock Movement",
-    "摄像机速度:": "Camera Speed:"
+    "摄像机速度:": "Camera Speed:",
+    "设置画布尺寸": "Set Canvas Size",
+    "无限制": "Unlimited",
+    "长度(X轴)上限:": "Length (X) Limit:",
+    "宽度(Y轴)上限:": "Width (Y) Limit:",
+    "高度(Z轴)上限:": "Height (Z) Limit:",
+    "导入地图拼接": "Merge Map",
+    "确认导入": "Confirm Import",
+    "取消导入": "Cancel Import",
+    "顺时针旋转90°": "Rotate +90°",
+    "逆时针旋转90°": "Rotate -90°",
+    "正在拼接:": "Merging:",
+    "设计稿文件 (*.json);;所有文件 (*.*)": "Design Files (*.json);;All Files (*.*)",
+    "地图拼接完成": "Map merge complete."
 }
 EN_TO_ZH = {v: k for k, v in TRANSLATIONS.items()}
 
@@ -262,9 +277,10 @@ class LayerData:
 
 @dataclass
 class ShapeData:
-    shape_type: str
-    x: float
-    y: float
+    uid: str = field(default_factory=lambda: str(uuid.uuid4()))
+    shape_type: str = "square"
+    x: float = 0.0
+    y: float = 0.0
     width: float = 1.0
     height: float = 1.0
     depth: float = 1.0
@@ -291,14 +307,52 @@ class ShapeData:
     is_locked: bool = False
 
 
+class MapSizeDialog(QDialog):
+    def __init__(self, parent: QWidget, limit_enabled=False, x=100.0, y=100.0, z=100.0):
+        super().__init__(parent)
+        self.setWindowTitle(_T("设置画布尺寸"))
+        self.resize(320, 180)
+        
+        self.unlimited_cb = QCheckBox(_T("无限制"))
+        self.unlimited_cb.setChecked(not limit_enabled)
+        
+        self.x_spin = QDoubleSpinBox(); self.x_spin.setRange(1.0, 99999.0); self.x_spin.setValue(x); self.x_spin.setSuffix(" m")
+        self.y_spin = QDoubleSpinBox(); self.y_spin.setRange(1.0, 99999.0); self.y_spin.setValue(y); self.y_spin.setSuffix(" m")
+        self.z_spin = QDoubleSpinBox(); self.z_spin.setRange(1.0, 99999.0); self.z_spin.setValue(z); self.z_spin.setSuffix(" m")
+        
+        self.unlimited_cb.toggled.connect(self.on_unlimited_toggled)
+        self.on_unlimited_toggled(self.unlimited_cb.isChecked())
+        
+        layout = QFormLayout(self)
+        layout.addRow(self.unlimited_cb)
+        layout.addRow(_T("长度(X轴)上限:"), self.x_spin)
+        layout.addRow(_T("宽度(Y轴)上限:"), self.y_spin)
+        layout.addRow(_T("高度(Z轴)上限:"), self.z_spin)
+        
+        btns = QHBoxLayout()
+        for t, f in [(_T("确定"), self.accept), (_T("取消"), self.reject)]:
+            b = QPushButton(t)
+            b.clicked.connect(f)
+            btns.addWidget(b)
+        layout.addRow(btns)
+
+    def on_unlimited_toggled(self, checked):
+        self.x_spin.setEnabled(not checked)
+        self.y_spin.setEnabled(not checked)
+        self.z_spin.setEnabled(not checked)
+
+    def get_data(self):
+        return not self.unlimited_cb.isChecked(), self.x_spin.value(), self.y_spin.value(), self.z_spin.value()
+
+
 class LayerDialog(QDialog):
-    def __init__(self, parent: QWidget, current_name: str = "", current_z: float = 0.0):
+    def __init__(self, parent: QWidget, current_name: str = "", current_z: float = 0.0, max_z: float = 9999.0):
         super().__init__(parent)
         self.setWindowTitle(_T("图层设置"))
         self.resize(320, 130)
         self.name_edit = QLineEdit(current_name)
         self.z_spin = QDoubleSpinBox()
-        self.z_spin.setRange(-9999.0, 9999.0)
+        self.z_spin.setRange(-9999.0, max_z)
         self.z_spin.setSingleStep(0.5)
         self.z_spin.setSuffix(" m")
         self.z_spin.setValue(current_z)
@@ -358,6 +412,12 @@ class BaseDesignItem(QGraphicsObject):
         self.setFlags(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable | QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges | QGraphicsItem.GraphicsItemFlag.ItemIsFocusable)
 
     def itemChange(self, change, value):
+        if change == QGraphicsItem.GraphicsItemChange.ItemPositionChange:
+            scene = self.scene()
+            if scene and getattr(scene, "main_window", None) and scene.main_window.map_limit_enabled:
+                limit_x = scene.main_window.map_size_x / 2.0
+                limit_y = scene.main_window.map_size_y / 2.0
+                return QPointF(max(-limit_x, min(limit_x, value.x())), max(-limit_y, min(limit_y, value.y())))
         if change == QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged:
             self.shape_data.x, self.shape_data.y = value.x(), value.y()
             self.selected_changed.emit(self)
@@ -479,8 +539,8 @@ class TransformableItem(BaseDesignItem):
         if self.can_resize():
             painter.setBrush(QBrush(Qt.GlobalColor.white)); painter.setPen(QPen(Qt.GlobalColor.red, 0.03))
             painter.drawRect(self.get_handle_rect())
-            painter.setPen(QPen(Qt.GlobalColor.blue, 0.03)); painter.drawEllipse(self.get_rotate_rect())
-            painter.drawLine(QPointF(0, r.top()), QPointF(0, r.top() - 1.2))
+        painter.setPen(QPen(Qt.GlobalColor.blue, 0.03)); painter.drawEllipse(self.get_rotate_rect())
+        painter.drawLine(QPointF(0, r.top()), QPointF(0, r.top() - 1.2))
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.RightButton: 
@@ -582,8 +642,8 @@ class ShapeItem(TransformableItem):
         painter.drawPolygon(QPolygonF([QPointF(cx, cy - h*0.42), QPointF(cx - w*0.34, cy - h*0.10), QPointF(cx - w*0.22, cy + h*0.34), QPointF(cx + w*0.22, cy + h*0.34), QPointF(cx + w*0.34, cy - h*0.10)]))
         for sign in (-1, 1):
             painter.drawPolygon(QPolygonF([QPointF(cx + sign*w*0.12, cy - h*0.30), QPointF(cx + sign*w*0.30, cy - h*0.52), QPointF(cx + sign*w*0.04, cy - h*0.40)]))
-            painter.setBrush(QBrush(Qt.GlobalColor.white))
-            painter.drawEllipse(QPointF(cx + sign*w*0.10, cy - h*0.08), min(w, h)*0.05, min(w, h)*0.05)
+        painter.setBrush(QBrush(Qt.GlobalColor.white))
+        painter.drawEllipse(QPointF(cx + sign*w*0.10, cy - h*0.08), min(w, h)*0.05, min(w, h)*0.05)
 
     def draw_stair_direction_arrow(self, painter):
         r = self.shape_rect()
@@ -740,7 +800,7 @@ class LineItem(BaseDesignItem):
             painter.setPen(QPen(Qt.GlobalColor.black, max(0.05, self.shape_data.line_width) + 0.06, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
             if self.is_curve(): painter.drawPath(self.get_curve_path())
             else: painter.drawLine(QPointF(self.shape_data.x, self.shape_data.y), QPointF(self.shape_data.end_x, self.shape_data.end_y))
-            
+        
         painter.setPen(QPen(QColor(*self.shape_data.color), max(0.05, self.shape_data.line_width), Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
         if self.is_curve(): painter.drawPath(self.get_curve_path())
         else: painter.drawLine(QPointF(self.shape_data.x, self.shape_data.y), QPointF(self.shape_data.end_x, self.shape_data.end_y))
@@ -822,14 +882,21 @@ class LineItem(BaseDesignItem):
     def mouseMoveEvent(self, event):
         if getattr(self.shape_data, "is_locked", False) or not (event.buttons() & Qt.MouseButton.LeftButton) or not self.dragging_part: return super().mouseMoveEvent(event)
         self.prepareGeometryChange(); pos = event.pos()
+        
+        scene = self.scene()
+        if scene and getattr(scene, "main_window", None) and scene.main_window.map_limit_enabled:
+            limit_x = scene.main_window.map_size_x / 2.0
+            limit_y = scene.main_window.map_size_y / 2.0
+            pos = QPointF(max(-limit_x, min(limit_x, pos.x())), max(-limit_y, min(limit_y, pos.y())))
+
         if self.dragging_part == "start": self.shape_data.x, self.shape_data.y = pos.x(), pos.y()
         elif self.dragging_part == "end": self.shape_data.end_x, self.shape_data.end_y = pos.x(), pos.y()
         elif self.dragging_part == "anchor" and self.dragging_anchor_index is not None: self.shape_data.control_points[self.dragging_anchor_index] = (pos.x(), pos.y())
         elif self.dragging_part == "whole":
-            dx, dy = pos.x() - self.drag_last_pos.x(), pos.y() - self.drag_last_pos.y()
+            dx, dy = event.pos().x() - self.drag_last_pos.x(), event.pos().y() - self.drag_last_pos.y()
             self.shape_data.x += dx; self.shape_data.y += dy; self.shape_data.end_x += dx; self.shape_data.end_y += dy
             if self.shape_data.control_points: self.shape_data.control_points = [(x + dx, y + dy) for x, y in self.shape_data.control_points]
-        self.drag_last_pos = pos; self.update(); self.selected_changed.emit(self); self.changed.emit(); event.accept()
+            self.drag_last_pos = event.pos(); self.update(); self.selected_changed.emit(self); self.changed.emit(); event.accept()
 
     def mouseReleaseEvent(self, event):
         self.dragging_part = self.dragging_anchor_index = None; super().mouseReleaseEvent(event)
@@ -906,12 +973,34 @@ class DesignScene(QGraphicsScene):
         return res
 
     def drawBackground(self, painter, rect):
-        painter.fillRect(rect, QColor(248, 249, 251)); painter.setPen(QPen(QColor(220, 225, 230), 0.02))
-        left, right, top, bottom = int(math.floor(rect.left())), int(math.ceil(rect.right())), int(math.floor(rect.top())), int(math.ceil(rect.bottom()))
+        painter.fillRect(rect, QColor(248, 249, 251))
+        
+        limit_enabled = getattr(self, "main_window", None) and self.main_window.map_limit_enabled
+        if limit_enabled:
+            limit_x = self.main_window.map_size_x
+            limit_y = self.main_window.map_size_y
+            map_rect = QRectF(-limit_x/2, -limit_y/2, limit_x, limit_y)
+            painter.fillRect(map_rect, QColor(255, 255, 255))
+            painter.setPen(QPen(QColor(100, 100, 100), 0.1))
+            painter.drawRect(map_rect)
+            
+            draw_rect = rect.intersected(map_rect)
+            if draw_rect.isNull(): return
+            left, right, top, bottom = int(math.floor(draw_rect.left())), int(math.ceil(draw_rect.right())), int(math.floor(draw_rect.top())), int(math.ceil(draw_rect.bottom()))
+        else:
+            left, right, top, bottom = int(math.floor(rect.left())), int(math.ceil(rect.right())), int(math.floor(rect.top())), int(math.ceil(rect.bottom()))
+
+        painter.setPen(QPen(QColor(220, 225, 230), 0.02))
         painter.drawLines([QLineF(x, top, x, bottom) for x in range(left, right + 1)])
         painter.drawLines([QLineF(left, y, right, y) for y in range(top, bottom + 1)])
+        
         painter.setPen(QPen(QColor(180, 180, 180), 0.05))
-        painter.drawLine(QPointF(rect.left(), 0), QPointF(rect.right(), 0)); painter.drawLine(QPointF(0, rect.top()), QPointF(0, rect.bottom()))
+        if limit_enabled:
+            painter.drawLine(QPointF(max(left, -limit_x/2), 0), QPointF(min(right, limit_x/2), 0))
+            painter.drawLine(QPointF(0, max(top, -limit_y/2)), QPointF(0, min(bottom, limit_y/2)))
+        else:
+            painter.drawLine(QPointF(rect.left(), 0), QPointF(rect.right(), 0))
+            painter.drawLine(QPointF(0, rect.top()), QPointF(0, rect.bottom()))
 
 
 class ToolListWidget(QListWidget):
@@ -949,7 +1038,7 @@ class ToolListWidget(QListWidget):
             if item and item.data(Qt.ItemDataRole.UserRole) in {"custom_2d", "custom_3d"}:
                 self.takeItem(self.row(item))
                 self.tool_list_changed.emit()
-                return
+            return
         super().keyPressEvent(event)
 
     def startDrag(self, supported_actions):
@@ -1029,6 +1118,11 @@ class DesignView(QGraphicsView):
         if not st: return event.ignore()
 
         pos, layer_idx = self.mapToScene(to_qpoint(event.position())), self.main_window.get_current_layer_index()
+        if getattr(self.main_window, "map_limit_enabled", False):
+            limit_x = self.main_window.map_size_x / 2.0
+            limit_y = self.main_window.map_size_y / 2.0
+            pos = QPointF(max(-limit_x, min(limit_x, pos.x())), max(-limit_y, min(limit_y, pos.y())))
+
         if st == "text":
             item = self.design_scene.add_text(pos, layer_idx, 0.0)
         elif st == "line":
@@ -1038,7 +1132,7 @@ class DesignView(QGraphicsView):
             item.shape_data.image_data = img_data
             item.shape_data.custom_3d_parts = parts
             if img_data: item.load_image()
-            
+        
         item.setSelected(True); self.design_scene.item_selected.emit(item); self.main_window.push_history_snapshot("drop_create"); event.acceptProposedAction()
 
     def mousePressEvent(self, event):
@@ -1055,7 +1149,7 @@ class DesignView(QGraphicsView):
             else:
                 self.main_window.show_empty_context_menu(self.mapToGlobal(event.pos()))
             return event.accept()
-            
+        
         if tool == "select" and event.button() == Qt.MouseButton.LeftButton:
             item = self.design_scene.itemAt(self.mapToScene(event.pos()), self.transform())
             if not item:
@@ -1074,7 +1168,7 @@ class DesignView(QGraphicsView):
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MouseButton.MiddleButton and self.is_panning:
             self.is_panning = False; self.setCursor(Qt.CursorShape.ArrowCursor); return event.accept()
-            
+        
         super().mouseReleaseEvent(event)
         
         if self.dragMode() == QGraphicsView.DragMode.RubberBandDrag:
@@ -1241,13 +1335,31 @@ class OpenGLLevelView(QOpenGLWidget):
 
     def draw_ground_grid(self):
         glColor4f(0.75, 0.78, 0.82, 1.0); glBegin(GL_LINES)
-        cx, cz = int(math.floor(self.camera_x)), int(math.floor(self.camera_z))
-        r = 100
-        for i in range(cx - r, cx + r + 1):
-            glVertex3f(i, 0, cz - r); glVertex3f(i, 0, cz + r)
-        for i in range(cz - r, cz + r + 1):
-            glVertex3f(cx - r, 0, i); glVertex3f(cx + r, 0, i)
-        glEnd()
+        if getattr(self, "map_limit_enabled", False):
+            lx, lz = self.map_size_x / 2.0, self.map_size_y / 2.0
+            min_x, max_x = int(math.floor(-lx)), int(math.ceil(lx))
+            min_z, max_z = int(math.floor(-lz)), int(math.ceil(lz))
+            for i in range(min_x, max_x + 1):
+                x = max(min_x, min(max_x, i))
+                glVertex3f(x, 0, -lz); glVertex3f(x, 0, lz)
+            for i in range(min_z, max_z + 1):
+                z = max(min_z, min(max_z, i))
+                glVertex3f(-lx, 0, z); glVertex3f(lx, 0, z)
+            glEnd()
+            glColor4f(0.5, 0.5, 0.5, 1.0); glBegin(GL_LINES)
+            glVertex3f(-lx, 0, -lz); glVertex3f(lx, 0, -lz)
+            glVertex3f(-lx, 0, lz); glVertex3f(lx, 0, lz)
+            glVertex3f(-lx, 0, -lz); glVertex3f(-lx, 0, lz)
+            glVertex3f(lx, 0, -lz); glVertex3f(lx, 0, lz)
+            glEnd()
+        else:
+            cx, cz = int(math.floor(self.camera_x)), int(math.floor(self.camera_z))
+            r = 100
+            for i in range(cx - r, cx + r + 1):
+                glVertex3f(i, 0, cz - r); glVertex3f(i, 0, cz + r)
+            for i in range(cz - r, cz + r + 1):
+                glVertex3f(cx - r, 0, i); glVertex3f(cx + r, 0, i)
+            glEnd()
 
     def get_line_sample_points(self, shape, steps: int = 60) -> List[Tuple[float, float]]:
         pts = [(shape.x, shape.y)] + (shape.control_points or []) + [(shape.end_x, shape.end_y)]
@@ -1435,16 +1547,13 @@ class OpenGLLevelView(QOpenGLWidget):
         for x, y in self.get_line_sample_points(shape, 80): glVertex3f(x, bz, y)
         glEnd(); glLineWidth(1.0)
 
-    def get_platform_binding_key(self, shape) -> str: return f"{shape.shape_type}|{shape.layer_index}|{shape.x:.3f}|{shape.y:.3f}|{shape.width:.3f}|{shape.height:.3f}|{shape.base_z + self.get_layer_z_offset(shape.layer_index):.3f}"
-
     def find_connected_platforms(self, stair):
         exp_s = exp_e = None
         for s in self.shapes:
             if s is stair or s.shape_type not in PLATFORM_TYPES: continue
-            k = self.get_platform_binding_key(s)
-            if stair.stair_start_binding == k: exp_s = s
-            if stair.stair_end_binding == k: exp_e = s
-        if exp_s and exp_e: return [exp_s, exp_e]
+            if stair.stair_start_binding == s.uid: exp_s = s
+            if stair.stair_end_binding == s.uid: exp_e = s
+            if exp_s and exp_e: return [exp_s, exp_e]
         cands = sorted([s for s in self.shapes if s is not stair and s.shape_type in PLATFORM_TYPES and check_point_inside_platform(s, stair.x, stair.y)], key=lambda x: x.base_z + self.get_layer_z_offset(x.layer_index))
         uh = []
         for c in cands:
@@ -1469,7 +1578,7 @@ class OpenGLLevelView(QOpenGLWidget):
         else:
             start_z = pz0
             end_z = pz0 + stair.depth * (1.0 if pz1 >= pz0 else -1.0)
-            
+        
         base_z_plane = min(start_z, end_z)
         rise = max(0.1, abs(end_z - start_z))
         steps = max(3, int(rise / 0.3))
@@ -1485,7 +1594,7 @@ class OpenGLLevelView(QOpenGLWidget):
                 step_h = sh * (i + 1)
             else:
                 step_h = sh * (steps - i)
-                
+            
             step_cy = base_z_plane + step_h / 2.0
             self.draw_box(cx, step_cy, 0, sw, step_h, max(0.5, stair.height), r, g, b)
 
@@ -1591,7 +1700,7 @@ class OpenGLLevelView(QOpenGLWidget):
             self.yaw += (event.position().x() - self.last_mouse_pos.x()) * 0.15
             self.pitch = max(-89.0, min(89.0, self.pitch - (event.position().y() - self.last_mouse_pos.y()) * 0.15))
             self.update()
-        self.last_mouse_pos, _ = event.position(), event.accept()
+            self.last_mouse_pos, _ = event.position(), event.accept()
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MouseButton.MiddleButton:
@@ -1616,11 +1725,15 @@ class OpenGLLevelView(QOpenGLWidget):
 class Level3DWindow(QMainWindow):
     TOOLBAR_HEIGHT = 52
 
-    def __init__(self, shapes, layers, show_labels=True, perspective_enabled=True, wireframe_enabled=False):
+    def __init__(self, shapes, layers, show_labels=True, perspective_enabled=True, wireframe_enabled=False, map_limit_enabled=False, map_size_x=100.0, map_size_y=100.0, map_size_z=100.0):
         super().__init__()
         self.setWindowTitle(_T("3D 关卡预览"))
         if not (icon := find_resource_icon()).isNull(): self.setWindowIcon(icon)
         self.opengl_view = OpenGLLevelView(shapes, layers, show_labels)
+        self.opengl_view.map_limit_enabled = map_limit_enabled
+        self.opengl_view.map_size_x = map_size_x
+        self.opengl_view.map_size_y = map_size_y
+        self.opengl_view.map_size_z = map_size_z
         self.opengl_view.set_perspective_enabled(perspective_enabled); self.opengl_view.set_wireframe_enabled(wireframe_enabled); self.opengl_view.setFixedSize(OpenGLLevelView.PREVIEW_WIDTH, OpenGLLevelView.PREVIEW_HEIGHT)
         self.show_labels_checkbox, self.perspective_checkbox, self.wireframe_checkbox = QCheckBox(_T("显示备注")), QCheckBox(_T("透视")), QCheckBox(_T("线框"))
         
@@ -1768,6 +1881,9 @@ class Custom3DEditorDialog(QDialog):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
+        self.map_limit_enabled = False
+        self.map_size_x, self.map_size_y, self.map_size_z = 100.0, 100.0, 100.0
+        
         self.base_window_title = _T("关卡地图设计工具")
         self.setWindowTitle(self.base_window_title); self.resize(1500, 920)
         if not (icon := find_resource_icon()).isNull(): self.setWindowIcon(icon)
@@ -1801,7 +1917,9 @@ class MainWindow(QMainWindow):
         self.stair_auto_height_cb = QCheckBox(_T("自动计算高度")); self.stair_auto_height_cb.setChecked(True); self.stair_auto_height_cb.toggled.connect(self.on_stair_auto_height_changed)
         self.shape_layer_combo.currentIndexChanged.connect(self.on_shape_layer_changed); self.stair_start_combo.currentIndexChanged.connect(self.on_stair_binding_changed); self.stair_end_combo.currentIndexChanged.connect(self.on_stair_binding_changed)
         self.stair_direction_combo.addItems([_T("正向"), _T("反向")]); self.stair_direction_combo.setItemData(0, "forward"); self.stair_direction_combo.setItemData(1, "backward"); self.stair_direction_combo.currentIndexChanged.connect(self.on_stair_direction_changed)
+        
         self.new_design_button = self._create_btn(_T("新建设计栏"), self.on_new_design); self.open_design_button = self._create_btn(_T("打开设计稿"), self.on_open_design)
+        self.merge_map_button = self._create_btn(_T("地图拼接"), self.on_merge_maps)
         self.save_design_button = self._create_btn(_T("保存设计稿"), lambda: self._perform_save(False)); self.save_as_design_button = self._create_btn(_T("设计稿另存为"), lambda: self._perform_save(True))
         self.export_design_button = self._create_btn(_T("导出设计栏图片"), self.on_export_design_image); self.generate_button = self._create_btn(_T("生成 3D 视图"), self.on_generate_3d)
         self.export_t3d_button = self._create_btn(_T("导入场景到UE5"), self.on_export_t3d)
@@ -1849,13 +1967,15 @@ class MainWindow(QMainWindow):
 
         if self.preview_window:
             translate_children(self.preview_window)
-            self.preview_window.setWindowTitle(_T("3D 关卡预览"))
+            self.preview_window.setWindowTitle(_T("3D 关极预览"))
 
         self.base_window_title = _T("关卡地图设计工具")
         self.update_window_title()
         self.refresh_layer_list()
         self.refresh_shape_layer_combo()
         self.refresh_stair_binding_combos()
+        if hasattr(self, "merge_lbl") and hasattr(self, "current_merge_filename"):
+            self.merge_lbl.setText(f"{_T('正在拼接:')} {self.current_merge_filename}")
         if self.current_item: self.on_item_selected(self.current_item)
         else: self.clear_properties()
 
@@ -1893,10 +2013,34 @@ class MainWindow(QMainWindow):
         depth_widget = QWidget(); dl = QHBoxLayout(depth_widget); dl.setContentsMargins(0, 0, 0, 0); dl.addWidget(self.depth_spin); dl.addWidget(self.stair_auto_height_cb)
         for w, t in [(self.label_edit, "标签"), (self.text_content_edit, "文字内容"), (self.font_size_spin, "字号"), (self.shape_layer_combo, "所属图层"), (self.base_z_spin, "底部高度"), (depth_widget, "高度/线宽"), (self.width_spin, "图形宽度"), (self.height_spin, "图形长度(2D高)"), (self.rotation_spin, "旋转角度"), (self.stair_start_combo, "楼梯起点平台"), (self.stair_end_combo, "楼梯终点平台"), (self.stair_direction_combo, "楼梯方向"), (self.size_label, "尺寸"), (self.color_button, "颜色")]: pl.addRow(_T(t), w)
         ll.addWidget(QLabel(_T("属性"))); ll.addWidget(pw); ll.addStretch()
+        
         rp, rl = QWidget(), QVBoxLayout(); rp.setLayout(rl)
-        rl.addWidget(QLabel(_T("设计栏（顶视图，单位：米）"))); rl.addWidget(self.view)
+        rl.addWidget(QLabel(_T("设计栏（顶视图，单位：米）")))
+        
+        # Merge Toolbar
+        self.merge_toolbar = QWidget()
+        self.merge_toolbar.setStyleSheet("background-color: #fff3c4; border: 1px solid #d4c28d; border-radius: 4px; padding: 4px;")
+        mtl = QHBoxLayout(self.merge_toolbar)
+        self.merge_lbl = QLabel()
+        btn_r_left = QPushButton(_T("逆时针旋转90°"))
+        btn_r_right = QPushButton(_T("顺时针旋转90°"))
+        btn_ok = QPushButton(_T("确认导入"))
+        btn_cancel = QPushButton(_T("取消导入"))
+        
+        btn_ok.clicked.connect(self.confirm_merge)
+        btn_cancel.clicked.connect(self.cancel_merge)
+        btn_r_left.clicked.connect(lambda: self.rotate_merge_group(-90))
+        btn_r_right.clicked.connect(lambda: self.rotate_merge_group(90))
+        
+        for w in (self.merge_lbl, btn_r_left, btn_r_right, btn_ok, btn_cancel): mtl.addWidget(w)
+        mtl.addStretch()
+        self.merge_toolbar.hide()
+        rl.addWidget(self.merge_toolbar)
+
+        rl.addWidget(self.view)
+        
         fl, al = QHBoxLayout(), QHBoxLayout()
-        for w in (self.new_design_button, self.open_design_button, self.save_design_button, self.save_as_design_button, self.undo_button, self.redo_button, self.shortcut_settings_button): fl.addWidget(w)
+        for w in (self.new_design_button, self.open_design_button, self.merge_map_button, self.save_design_button, self.save_as_design_button, self.undo_button, self.redo_button, self.shortcut_settings_button): fl.addWidget(w)
         for w in (self.export_design_button, self.generate_button, self.export_t3d_button): al.addWidget(w)
         rl.addLayout(fl); rl.addLayout(al); rl.addWidget(self.watermark_label)
         sp = QSplitter(); sp.addWidget(lp); sp.addWidget(rp); sp.setStretchFactor(1, 1); ml.addWidget(sp)
@@ -1919,7 +2063,7 @@ class MainWindow(QMainWindow):
                 is_vis = self.layers[layer_idx].is_visible
             else:
                 is_vis = True
-                
+            
             item.setOpacity(1.0 if is_vis else 0.5)
             item.setEnabled(is_vis)
             if not is_vis and item.isSelected():
@@ -1983,7 +2127,18 @@ class MainWindow(QMainWindow):
                     tool_data["parts"] = item.data(Qt.ItemDataRole.UserRole + 2) or []
                 custom_tools.append(tool_data)
 
-        return {"layers": [asdict(l) for l in self.layers], "shapes": [asdict(s) for s in self.scene.get_all_shapes()], "view": {"show_labels": self.is_3d_label_visible, "perspective_enabled": self.is_3d_perspective_enabled, "wireframe_enabled": self.is_3d_wireframe_enabled}, "shortcuts": dict(self.shortcut_settings), "current_design_file": self.current_design_file, "custom_tools": custom_tools}
+        return {
+            "layers": [asdict(l) for l in self.layers], 
+            "shapes": [asdict(s) for s in self.scene.get_all_shapes()], 
+            "view": {"show_labels": self.is_3d_label_visible, "perspective_enabled": self.is_3d_perspective_enabled, "wireframe_enabled": self.is_3d_wireframe_enabled}, 
+            "shortcuts": dict(self.shortcut_settings), 
+            "current_design_file": self.current_design_file, 
+            "custom_tools": custom_tools,
+            "map_limit_enabled": self.map_limit_enabled,
+            "map_size_x": self.map_size_x,
+            "map_size_y": self.map_size_y,
+            "map_size_z": self.map_size_z
+        }
 
     def restore_snapshot(self, sn: dict) -> None:
         self.is_history_suppressed = True
@@ -2011,12 +2166,20 @@ class MainWindow(QMainWindow):
             shapes = []
             for s in sn.get("shapes", []):
                 kwargs = {k: (tuple(v) if k == "color" and isinstance(v, list) else v) for k, v in s.items() if k in valid_keys}
+                if "uid" not in kwargs:
+                    kwargs["uid"] = str(uuid.uuid4())
                 shapes.append(ShapeData(**kwargs))
             vd = sn.get("view", {})
             self.is_3d_label_visible, self.is_3d_perspective_enabled, self.is_3d_wireframe_enabled = bool(vd.get("show_labels", True)), bool(vd.get("perspective_enabled", True)), bool(vd.get("wireframe_enabled", False))
             for k, dv in DEFAULT_SHORTCUTS.items(): self.shortcut_settings[k] = sn.get("shortcuts", {}).get(k, dv)
+            self.map_limit_enabled = sn.get("map_limit_enabled", False)
+            self.map_size_x = sn.get("map_size_x", 100.0)
+            self.map_size_y = sn.get("map_size_y", 100.0)
+            self.map_size_z = sn.get("map_size_z", 100.0)
+            
             self.scene.load_from_data(self.layers, shapes); self.refresh_layer_list(); self.refresh_shape_layer_combo(); self.refresh_stair_binding_combos(); self.layer_list.setCurrentRow(0); self.clear_properties(); self.apply_shortcuts(); self.current_design_file = sn.get("current_design_file", self.current_design_file)
             self.update_layer_visibility()
+            self.scene.update()
         finally: self.is_history_suppressed = False
 
     def push_history_snapshot(self, reason: str = "", force: bool = False) -> None:
@@ -2077,15 +2240,15 @@ class MainWindow(QMainWindow):
             rz = self.get_real_base_z(c)
             prefix = f"[{c.label}] " if c.label else ""
             n = f"{prefix}{i + 1}. {c.shape_type} (x={c.x:.1f}, y={c.y:.1f}, w={c.width:.1f}, h={c.height:.1f}, z={rz:.1f})"
-            k = f"{c.shape_type}|{c.layer_index}|{c.x:.3f}|{c.y:.3f}|{c.width:.3f}|{c.height:.3f}|{rz:.3f}"
-            self.stair_start_combo.addItem(n, k); self.stair_end_combo.addItem(n, k)
+            self.stair_start_combo.addItem(n, c.uid); self.stair_end_combo.addItem(n, c.uid)
         for cb in (self.stair_start_combo, self.stair_end_combo): cb.blockSignals(False)
 
     def get_current_layer_index(self): return max(0, self.layer_list.currentRow())
     def get_current_layer_z(self): return self.layers[idx].z_offset if 0 <= (idx := self.get_current_layer_index()) < len(self.layers) else 0.0
 
     def on_add_layer(self):
-        dlg = LayerDialog(self, f"{_T('第')}{len(self.layers) + 1}{_T('层')}", 0.0)
+        max_z = self.map_size_z if self.map_limit_enabled else 9999.0
+        dlg = LayerDialog(self, f"{_T('第')}{len(self.layers) + 1}{_T('层')}", 0.0, max_z)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             self.layers.append(LayerData(*dlg.get_data())); self.refresh_layer_list(); self.refresh_shape_layer_combo()
             self.layer_list.setCurrentRow(len(self.layers) - 1); self.mark_dirty(); self.push_history_snapshot("add_layer")
@@ -2093,7 +2256,8 @@ class MainWindow(QMainWindow):
     def on_edit_layer(self):
         idx = self.get_current_layer_index()
         if 0 <= idx < len(self.layers):
-            dlg = LayerDialog(self, self.layers[idx].name, self.layers[idx].z_offset)
+            max_z = self.map_size_z if self.map_limit_enabled else 9999.0
+            dlg = LayerDialog(self, self.layers[idx].name, self.layers[idx].z_offset, max_z)
             if dlg.exec() == QDialog.DialogCode.Accepted:
                 self.layers[idx] = LayerData(dlg.get_data()[0], dlg.get_data()[1], self.layers[idx].is_visible)
                 self.refresh_layer_list(); self.refresh_shape_layer_combo(); self.refresh_stair_binding_combos(); self.layer_list.setCurrentRow(idx)
@@ -2119,13 +2283,24 @@ class MainWindow(QMainWindow):
         selected_items = self.scene.selectedItems()
         if len(selected_items) != 1:
             return self.clear_properties()
-            
+        
         item = selected_items[0]
         if not isinstance(item, BaseDesignItem) or not item.scene():
             return self.clear_properties()
 
         self.current_item = item; self.refresh_stair_binding_combos(); self._toggle_property_signals(True)
         sd, rz = item.shape_data, self.get_real_base_z(item.shape_data)
+        
+        if self.map_limit_enabled:
+            layer_z = self.get_layer_z_offset(sd.layer_index)
+            max_base_z = max(-9999.0, self.map_size_z - layer_z)
+            self.base_z_spin.setRange(-9999.0, max_base_z)
+            max_depth = max(0.05, self.map_size_z - rz)
+            self.depth_spin.setRange(0.05, max_depth)
+        else:
+            self.base_z_spin.setRange(-9999.0, 9999.0)
+            self.depth_spin.setRange(0.05, 9999.0)
+
         self.label_edit.setText(sd.label); self.font_size_spin.setValue(sd.font_size); self.base_z_spin.setValue(sd.base_z)
         ist, isl, iss = isinstance(item, TextItem), isinstance(item, LineItem), isinstance(item, ShapeItem) and sd.shape_type == "stair"
         self.text_content_edit.setEnabled(ist); self.stair_start_combo.setEnabled(iss); self.stair_end_combo.setEnabled(iss); self.stair_direction_combo.setEnabled(iss)
@@ -2159,7 +2334,7 @@ class MainWindow(QMainWindow):
             self.rotation_spin.setEnabled(True)
             self.width_spin.setEnabled(item.can_resize())
             self.height_spin.setEnabled(item.can_resize())
-            
+        
         if 0 <= sd.layer_index < self.shape_layer_combo.count(): self.shape_layer_combo.setCurrentIndex(sd.layer_index)
         for cb, v in [(self.stair_start_combo, sd.stair_start_binding if iss else ""), (self.stair_end_combo, sd.stair_end_binding if iss else ""), (self.stair_direction_combo, sd.stair_direction if iss else "forward")]:
             cb.setCurrentIndex(max(0, cb.findData(v)))
@@ -2171,6 +2346,8 @@ class MainWindow(QMainWindow):
 
     def clear_properties(self):
         self.current_item = None; self._toggle_property_signals(True)
+        self.base_z_spin.setRange(-9999.0, 9999.0)
+        self.depth_spin.setRange(0.05, 9999.0)
         self.label_edit.clear(); self.text_content_edit.clear(); self.text_content_edit.setEnabled(False); self.font_size_spin.setValue(100.0); self.base_z_spin.setValue(0.0); self.depth_spin.setValue(1.0); self.depth_spin.setEnabled(True); self.stair_start_combo.setEnabled(False); self.stair_end_combo.setEnabled(False); self.stair_direction_combo.setEnabled(False)
         self.stair_auto_height_cb.setVisible(False)
         self.width_spin.setValue(1.0); self.width_spin.setEnabled(True)
@@ -2197,12 +2374,12 @@ class MainWindow(QMainWindow):
             self.current_item.shape_data.text_width = value
         else:
             self.current_item.shape_data.width = value
-            st = self.current_item.shape_data.shape_type
-            if getattr(self.current_item, "is_character_shape", lambda: False)() == False and st in {"square", "circle", "sphere", "cone"}:
-                self.current_item.shape_data.height = value
-                self._toggle_property_signals(True)
-                self.height_spin.setValue(value)
-                self._toggle_property_signals(False)
+        st = self.current_item.shape_data.shape_type
+        if getattr(self.current_item, "is_character_shape", lambda: False)() == False and st in {"square", "circle", "sphere", "cone"}:
+            self.current_item.shape_data.height = value
+            self._toggle_property_signals(True)
+            self.height_spin.setValue(value)
+            self._toggle_property_signals(False)
         if hasattr(self.current_item, "update_text_style"): self.current_item.update_text_style()
         self.current_item.update()
         self._apply_item_change("width_changed", update_ui=False)
@@ -2214,12 +2391,12 @@ class MainWindow(QMainWindow):
             self.current_item.shape_data.text_height = value
         else:
             self.current_item.shape_data.height = value
-            st = self.current_item.shape_data.shape_type
-            if getattr(self.current_item, "is_character_shape", lambda: False)() == False and st in {"square", "circle", "sphere", "cone"}:
-                self.current_item.shape_data.width = value
-                self._toggle_property_signals(True)
-                self.width_spin.setValue(value)
-                self._toggle_property_signals(False)
+        st = self.current_item.shape_data.shape_type
+        if getattr(self.current_item, "is_character_shape", lambda: False)() == False and st in {"square", "circle", "sphere", "cone"}:
+            self.current_item.shape_data.width = value
+            self._toggle_property_signals(True)
+            self.width_spin.setValue(value)
+            self._toggle_property_signals(False)
         if hasattr(self.current_item, "update_text_style"): self.current_item.update_text_style()
         self.current_item.update()
         self._apply_item_change("height_changed", update_ui=False)
@@ -2292,8 +2469,18 @@ class MainWindow(QMainWindow):
             self.scene.clearSelection(); self.paste_offset_index += 1; off, cis = 0.6 * self.paste_offset_index, []
             for src in self.clipboard_shapes:
                 sd = self.clone_shape_data(src)
+                sd.uid = str(uuid.uuid4()) # fresh uuid for pasted item
                 sd.x += off; sd.y += off; sd.end_x += off; sd.end_y += off
                 if sd.control_points: sd.control_points = [(x + off, y + off) for x, y in sd.control_points]
+                
+                if getattr(self, "map_limit_enabled", False):
+                    limit_x = self.map_size_x / 2.0
+                    limit_y = self.map_size_y / 2.0
+                    sd.x = max(-limit_x, min(limit_x, sd.x))
+                    sd.y = max(-limit_y, min(limit_y, sd.y))
+                    sd.end_x = max(-limit_x, min(limit_x, sd.end_x))
+                    sd.end_y = max(-limit_y, min(limit_y, sd.end_y))
+                
                 it = LineItem(sd) if sd.shape_type == "line" else TextItem(sd) if sd.shape_type == "text" else ShapeItem(sd)
                 self.scene._init_item(it, None if sd.shape_type == "line" else QPointF(sd.x, sd.y))
                 it.setSelected(True); cis.append(it)
@@ -2312,6 +2499,7 @@ class MainWindow(QMainWindow):
         elif res == reset_act: self.view.centerOn(0, 0)
 
     def delete_selected_items(self):
+        if hasattr(self, "merge_group") and self.merge_group and self.merge_group.isSelected(): return
         if sitems := self.get_selected_design_items():
             self.is_history_suppressed = True
             try:
@@ -2320,7 +2508,7 @@ class MainWindow(QMainWindow):
                 self.is_history_suppressed = False
             self.clear_properties(); self.refresh_stair_binding_combos(); self.mark_dirty(); self.push_history_snapshot("delete_selected")
 
-    def reset_to_new_design(self):
+    def reset_to_new_design(self, limit_enabled=False, sx=100.0, sy=100.0, sz=100.0):
         self.is_history_suppressed = True
         try:
             for i in range(self.tool_list.count() - 1, -1, -1):
@@ -2328,12 +2516,16 @@ class MainWindow(QMainWindow):
                 st = item.data(Qt.ItemDataRole.UserRole)
                 if st in ("custom_2d", "custom_3d"):
                     self.tool_list.takeItem(i)
-                    
+            
+            self.map_limit_enabled = limit_enabled
+            self.map_size_x, self.map_size_y, self.map_size_z = sx, sy, sz
+            
             self.scene.clear(); self.layers = [LayerData(_T("第1层"), 0.0), LayerData(_T("第2层"), 3.0), LayerData(_T("第3层"), 6.0)]
             self.current_item = self.preview_window = None; self.current_design_file = ""; self.clipboard_shapes = []; self.paste_offset_index = 0
             self.refresh_layer_list(); self.refresh_shape_layer_combo(); self.refresh_stair_binding_combos(); self.layer_list.setCurrentRow(0)
             self.clear_properties(); self.mark_clean()
             self.update_layer_visibility()
+            self.scene.update()
         finally: self.is_history_suppressed = False
         self.history_snapshots, self.history_index = [], -1; self.push_history_snapshot("reset", force=True)
 
@@ -2357,7 +2549,11 @@ class MainWindow(QMainWindow):
         return True if res == QMessageBox.StandardButton.No else self._perform_save()
 
     def on_new_design(self):
-        if self.maybe_save_before_destructive_action("新建设计栏"): self.reset_to_new_design()
+        if self.maybe_save_before_destructive_action("新建设计栏"):
+            dlg = MapSizeDialog(self)
+            if dlg.exec() == QDialog.DialogCode.Accepted:
+                enabled, x, y, z = dlg.get_data()
+                self.reset_to_new_design(enabled, x, y, z)
 
     def on_open_design(self):
         if not self.maybe_save_before_destructive_action("打开设计稿"): return
@@ -2368,13 +2564,142 @@ class MainWindow(QMainWindow):
                 QMessageBox.information(self, _T("打开成功"), _T("已打开设计稿：\n") + fp)
             except (OSError, json.JSONDecodeError, TypeError, ValueError): QMessageBox.warning(self, _T("打开失败"), _T("设计稿文件读取失败。"))
 
+    def on_merge_maps(self):
+        fps, _ = QFileDialog.getOpenFileNames(self, _T("导入地图拼接"), "", _T("设计稿文件 (*.json);;所有文件 (*.*)"))
+        if not fps: return
+        self.merge_queue = fps
+        self.process_next_merge()
+
+    def process_next_merge(self):
+        if not getattr(self, "merge_queue", []):
+            if hasattr(self, "merge_toolbar") and self.merge_toolbar.isVisible():
+                self.merge_toolbar.hide()
+                QMessageBox.information(self, _T("提示"), _T("地图拼接完成"))
+            return
+        
+        fp = self.merge_queue.pop(0)
+        try:
+            with open(fp, "r", encoding="utf-8") as f: 
+                sn = json.load(f)
+            
+            imp_layers = [LayerData(l.get("name", "未命名"), float(l.get("z_offset", 0.0)), bool(l.get("is_visible", True))) for l in sn.get("layers", [])]
+            valid_keys = inspect.signature(ShapeData).parameters.keys()
+            imp_shapes = []
+            for s in sn.get("shapes", []):
+                kwargs = {k: (tuple(v) if k == "color" and isinstance(v, list) else v) for k, v in s.items() if k in valid_keys}
+                if "uid" not in kwargs: kwargs["uid"] = str(uuid.uuid4())
+                imp_shapes.append(ShapeData(**kwargs))
+            
+            # Map old UUIDs to fresh UUIDs so we don't conflict with current scene
+            uid_map = {}
+            for s in imp_shapes:
+                new_uid = str(uuid.uuid4())
+                uid_map[s.uid] = new_uid
+                s.uid = new_uid
+            
+            for s in imp_shapes:
+                if s.stair_start_binding in uid_map: s.stair_start_binding = uid_map[s.stair_start_binding]
+                if s.stair_end_binding in uid_map: s.stair_end_binding = uid_map[s.stair_end_binding]
+            
+            # Map layers by matching name
+            layer_idx_map = {}
+            for i, imp_l in enumerate(imp_layers):
+                found_idx = next((idx for idx, l in enumerate(self.layers) if l.name == imp_l.name), -1)
+                if found_idx == -1:
+                    self.layers.append(LayerData(imp_l.name, imp_l.z_offset))
+                    found_idx = len(self.layers) - 1
+                layer_idx_map[i] = found_idx
+            
+            self.refresh_layer_list()
+            self.refresh_shape_layer_combo()
+            
+            self.merge_items = []
+            self.scene.clearSelection()
+            for sd in imp_shapes:
+                sd.layer_index = layer_idx_map.get(sd.layer_index, 0)
+                it = LineItem(sd) if sd.shape_type == "line" else TextItem(sd) if sd.shape_type == "text" else ShapeItem(sd)
+                self.scene._init_item(it, None if sd.shape_type == "line" else QPointF(sd.x, sd.y))
+                it.setOpacity(0.65) # Visual indicator that it's a temp merge preview
+                self.merge_items.append(it)
+            
+            self.scene.normalize_z_orders()
+            self.merge_group = self.scene.createItemGroup(self.merge_items)
+            self.merge_group.setFlags(QGraphicsItem.GraphicsItemFlag.ItemIsMovable | QGraphicsItem.GraphicsItemFlag.ItemIsSelectable)
+            self.merge_group.setSelected(True)
+            self.view.centerOn(self.merge_group)
+            
+            self.current_merge_filename = os.path.basename(fp)
+            self.merge_lbl.setText(f"{_T('正在拼接:')} {self.current_merge_filename}")
+            self.merge_toolbar.show()
+            
+        except Exception as e:
+            QMessageBox.warning(self, _T("错误"), f"读取 {os.path.basename(fp)} 失败: {e}")
+            self.process_next_merge()
+
+    def rotate_merge_group(self, angle):
+        if hasattr(self, "merge_group") and self.merge_group:
+            br = self.merge_group.boundingRect()
+            center = br.center()
+            self.merge_group.setTransformOriginPoint(center)
+            self.merge_group.setRotation(self.merge_group.rotation() + angle)
+
+    def confirm_merge(self):
+        if hasattr(self, "merge_group") and self.merge_group:
+            self.scene.destroyItemGroup(self.merge_group)
+            for item in self.merge_items:
+                item.setOpacity(1.0)
+                if isinstance(item, ShapeItem) or isinstance(item, TextItem):
+                    item.shape_data.x = item.scenePos().x()
+                    item.shape_data.y = item.scenePos().y()
+                    item.shape_data.rotation = (item.shape_data.rotation + item.rotation()) % 360
+                    item.setRotation(item.shape_data.rotation)
+                    item.setPos(item.shape_data.x, item.shape_data.y)
+                elif isinstance(item, LineItem):
+                    transform = item.sceneTransform()
+                    sp = transform.map(QPointF(item.shape_data.x, item.shape_data.y))
+                    ep = transform.map(QPointF(item.shape_data.end_x, item.shape_data.end_y))
+                    item.shape_data.x, item.shape_data.y = sp.x(), sp.y()
+                    item.shape_data.end_x, item.shape_data.end_y = ep.x(), ep.y()
+                    if item.shape_data.control_points:
+                        new_cps = []
+                        for cx, cy in item.shape_data.control_points:
+                            cp = transform.map(QPointF(cx, cy))
+                            new_cps.append((cp.x(), cp.y()))
+                        item.shape_data.control_points = new_cps
+                    item.setPos(0, 0)
+                    item.setRotation(0)
+                    item.update()
+            self.merge_group = None
+            self.merge_items = []
+            self.update_layer_visibility()
+            self.refresh_stair_binding_combos()
+            self.push_history_snapshot("confirm_merge")
+            self.process_next_merge()
+
+    def cancel_merge(self):
+        if hasattr(self, "merge_group") and self.merge_group:
+            self.scene.destroyItemGroup(self.merge_group)
+            for item in self.merge_items:
+                self.scene.removeItem(item)
+            self.merge_group = None
+            self.merge_items = []
+            self.process_next_merge()
+
     def on_export_design_image(self):
         if not self.scene.get_all_shapes(): return QMessageBox.information(self, _T("提示"), _T("设计栏中还没有图形。"))
         fp, _ = QFileDialog.getSaveFileName(self, _T("导出设计栏图片"), "design_view.png", "PNG 图片 (*.png);;JPG 图片 (*.jpg *.jpeg)")
         if not fp: return
         if not fp.lower().endswith((".png", ".jpg", ".jpeg")): fp += ".png"
         ir, sr = self.scene.itemsBoundingRect(), self.scene.sceneRect()
-        tr = sr if ir.isNull() or ir.width() <= 0 or ir.height() <= 0 else ir.united(sr.intersected(ir)).adjusted(-2, -2, 2, 2)
+        
+        if self.map_limit_enabled:
+            limit_x = self.map_size_x
+            limit_y = self.map_size_y
+            map_rect = QRectF(-limit_x/2, -limit_y/2, limit_x, limit_y)
+            tr = map_rect
+        else:
+            tr = sr if ir.isNull() or ir.width() <= 0 or ir.height() <= 0 else ir.united(sr.intersected(ir)).adjusted(-2, -2, 2, 2)
+        
         w, h = max(800, int(tr.width() * 60)), max(800, int(tr.height() * 60))
         img = QImage(w, h, QImage.Format.Format_ARGB32); img.fill(QColor(255, 255, 255))
         p = QPainter(img); p.setRenderHint(QPainter.RenderHint.Antialiasing); p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
@@ -2385,7 +2710,7 @@ class MainWindow(QMainWindow):
     def on_generate_3d(self):
         shapes = self.scene.get_all_shapes()
         if not shapes: return QMessageBox.information(self, _T("提示"), _T("设计栏中还没有图形。"))
-        self.preview_window = Level3DWindow(shapes, self.layers, self.is_3d_label_visible, self.is_3d_perspective_enabled, self.is_3d_wireframe_enabled)
+        self.preview_window = Level3DWindow(shapes, self.layers, self.is_3d_label_visible, self.is_3d_perspective_enabled, self.is_3d_wireframe_enabled, self.map_limit_enabled, self.map_size_x, self.map_size_y, self.map_size_z)
         self.preview_window.show_labels_checkbox.toggled.connect(lambda c: setattr(self, "is_3d_label_visible", c))
         self.preview_window.perspective_checkbox.toggled.connect(lambda c: setattr(self, "is_3d_perspective_enabled", c))
         self.preview_window.wireframe_checkbox.toggled.connect(lambda c: setattr(self, "is_3d_wireframe_enabled", c))
@@ -2395,7 +2720,7 @@ class MainWindow(QMainWindow):
         shapes = self.scene.get_all_shapes()
         if not shapes:
             return QMessageBox.information(self, _T("提示"), _T("设计栏中还没有图形。"))
-            
+        
         is_ue5_open = False
         if os.name == 'nt':
             import ctypes
@@ -2423,11 +2748,11 @@ class MainWindow(QMainWindow):
         if not is_ue5_open:
             QMessageBox.warning(self, _T("导入失败"), _T("导入失败，请先打开UE5关卡"))
             return
-            
+        
         if self.is_dirty:
             if not self._perform_save():
                 return
-                
+        
         try:
             t3d_content = self.generate_t3d_content(shapes, self.layers)
             QApplication.clipboard().setText(t3d_content)
@@ -2438,7 +2763,7 @@ class MainWindow(QMainWindow):
     def generate_t3d_content(self, shapes, layers):
         out = []
         out.append('Begin Map Name="/Game/LevelMapDesign"')
-        out.append('   Begin Level Name="PersistentLevel"')
+        out.append('    Begin Level Name="PersistentLevel"')
         
         actor_counter = 1
         
@@ -2446,21 +2771,21 @@ class MainWindow(QMainWindow):
             nonlocal actor_counter
             actor_name = f"StaticMeshActor_{actor_counter}"
             comp_name = f"StaticMeshComponent0"
-            folder_str = f'\n         FolderPath="{folder_name}"' if folder_name else ""
+            folder_str = f'\n    FolderPath="{folder_name}"' if folder_name else ""
             
-            actor_str = f"""      Begin Actor Class=/Script/Engine.StaticMeshActor Name="{actor_name}"{folder_str}
-         Begin Object Class=/Script/Engine.StaticMeshComponent Name="{comp_name}"
-         End Object
-         Begin Object Name="{comp_name}"
+            actor_str = f"""    Begin Actor Class=/Script/Engine.StaticMeshActor Name="{actor_name}"{folder_str}
+        Begin Object Class=/Script/Engine.StaticMeshComponent Name="{comp_name}"
+        End Object
+        Begin Object Name="{comp_name}"
             StaticMesh=StaticMesh'"{mesh_path}"'
             RelativeLocation=(X={x:.6f},Y={y:.6f},Z={z:.6f})
             RelativeRotation=(Pitch={pitch:.6f},Yaw={yaw:.6f},Roll={roll:.6f})
             RelativeScale3D=(X={sx:.6f},Y={sy:.6f},Z={sz:.6f})
-         End Object
-         StaticMeshComponent="{comp_name}"
-         RootComponent="{comp_name}"
-         ActorLabel="{label}"
-      End Actor"""
+        End Object
+        StaticMeshComponent="{comp_name}"
+        RootComponent="{comp_name}"
+        ActorLabel="{label}"
+    End Actor"""
             out.append(actor_str)
             actor_counter += 1
 
@@ -2471,7 +2796,7 @@ class MainWindow(QMainWindow):
             st = shape.shape_type
             if st in {"text", "line", "custom_2d"}:
                 continue
-                
+            
             base_z = get_real_base_z_local(shape)
             
             ue_x = shape.x * 100.0
@@ -2480,46 +2805,46 @@ class MainWindow(QMainWindow):
             ue_yaw = -shape.rotation
             
             label = shape.label if shape.label else f"{st}_{actor_counter}"
-            folder_name = shape.label.strip() if shape.label.strip() else st
+            layer_name = layers[shape.layer_index].name if 0 <= shape.layer_index < len(layers) else "UnnamedLayer"
+            folder_name = layer_name 
 
             if st in {"square", "rectangle"}:
                 mesh = "/Engine/BasicShapes/Cube.Cube"
                 sx, sy, sz = shape.width, shape.height, shape.depth
                 add_actor(mesh, label, ue_x, ue_y, ue_z, sx, sy, sz, 0, ue_yaw, 0, folder_name)
-                
+            
             elif st in {"circle", "ellipse"}:
                 mesh = "/Engine/BasicShapes/Cylinder.Cylinder"
                 sx, sy, sz = shape.width, shape.height, shape.depth
                 add_actor(mesh, label, ue_x, ue_y, ue_z, sx, sy, sz, 0, ue_yaw, 0, folder_name)
-                
+            
             elif st == "sphere":
                 mesh = "/Engine/BasicShapes/Sphere.Sphere"
                 sx, sy, sz = shape.width, shape.height, shape.depth
                 add_actor(mesh, label, ue_x, ue_y, ue_z, sx, sy, sz, 0, ue_yaw, 0, folder_name)
-                
+            
             elif st == "cone":
                 mesh = "/Engine/BasicShapes/Cone.Cone"
                 sx, sy, sz = shape.width, shape.height, shape.depth
                 add_actor(mesh, label, ue_x, ue_y, ue_z, sx, sy, sz, 0, ue_yaw, 0, folder_name)
-                
+            
             elif st == "pyramid":
                 mesh = "/Engine/BasicShapes/Cone.Cone"
                 sx, sy, sz = shape.width, shape.height, shape.depth
                 add_actor(mesh, label, ue_x, ue_y, ue_z, sx, sy, sz, 0, ue_yaw, 0, folder_name)
-                
+            
             elif st in {"player", "enemy"}:
                 mesh = "/Engine/BasicShapes/Cylinder.Cylinder"
                 sx, sy, sz = shape.width * 0.5, shape.height * 0.5, shape.depth
                 add_actor(mesh, label, ue_x, ue_y, ue_z, sx, sy, sz, 0, ue_yaw, 0, folder_name)
-                
+            
             elif st == "stair":
                 mesh = "/Engine/BasicShapes/Cube.Cube"
                 conn_0 = conn_1 = None
                 for s in shapes:
                     if s is shape or s.shape_type not in PLATFORM_TYPES: continue
-                    k = f"{s.shape_type}|{s.layer_index}|{s.x:.3f}|{s.y:.3f}|{s.width:.3f}|{s.height:.3f}|{get_real_base_z_local(s):.3f}"
-                    if shape.stair_start_binding == k: conn_0 = s
-                    if shape.stair_end_binding == k: conn_1 = s
+                    if shape.stair_start_binding == s.uid: conn_0 = s
+                    if shape.stair_end_binding == s.uid: conn_1 = s
                 
                 if not (conn_0 and conn_1):
                     cands = sorted([s for s in shapes if s is not shape and s.shape_type in PLATFORM_TYPES and check_point_inside_platform(s, shape.x, shape.y)], key=lambda x: get_real_base_z_local(x))
@@ -2570,7 +2895,7 @@ class MainWindow(QMainWindow):
                         step_h = sh * (i + 1)
                     else:
                         step_h = sh * (steps - i)
-                        
+                    
                     world_z = base_z_plane + step_h / 2.0
                     
                     sx = sw
@@ -2613,7 +2938,7 @@ class MainWindow(QMainWindow):
                         mesh = "/Engine/BasicShapes/Cone.Cone"
                         add_actor(mesh, f"{label}_part_{part_idx}", world_x*100, -world_y*100, world_z*100, pw, pd, ph, 0, ue_yaw, 0, folder_name)
 
-        out.append('   End Level')
+        out.append('    End Level')
         out.append('End Map')
         
         return "\n".join(out)
